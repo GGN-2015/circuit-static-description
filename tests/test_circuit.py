@@ -1,4 +1,10 @@
 import unittest
+import sys
+from pathlib import Path
+
+root_dir = Path(__file__).resolve().parents[1]
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
 
 from circuit_static_description import Circuit, CircuitError, CircuitFormatError
 
@@ -43,6 +49,55 @@ class CircuitVariableTests(unittest.TestCase):
         )
 
         self.assertEqual(circuit.evaluate([1, 0]), [1])
+
+    def test_evaluate_reuses_compiled_graph_after_first_parse(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=1,
+            variables={"V0": "XOR(I0, I1)"},
+            outputs=["NOT(V0)"],
+        )
+        parse_count = 0
+        original_parse_expression = circuit._parse_expression
+
+        def count_parse_expression(text: str):
+            nonlocal parse_count
+            parse_count += 1
+            return original_parse_expression(text)
+
+        circuit._parse_expression = count_parse_expression
+
+        self.assertEqual(circuit.evaluate([1, 0]), [0])
+        self.assertEqual(circuit.evaluate([0, 0]), [1])
+        self.assertEqual(parse_count, 2)
+
+    def test_compiled_graph_evaluates_only_output_dependencies(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=1,
+            variables=[
+                ("V0", "I0"),
+                ("V1", "I1"),
+                ("V2", "AND(V0, V1)"),
+            ],
+            outputs=["V2"],
+        )
+        graph = circuit._ensure_compiled_graph()
+
+        self.assertEqual(graph.evaluation_order, (0, 1, 2))
+
+        circuit = Circuit(
+            input_count=2,
+            output_count=1,
+            variables=[
+                ("V0", "I0"),
+                ("V1", "I1"),
+            ],
+            outputs=["V0"],
+        )
+        graph = circuit._ensure_compiled_graph()
+
+        self.assertEqual(graph.evaluation_order, (0,))
 
     def test_rejects_non_numeric_variable_name(self) -> None:
         with self.assertRaises(CircuitFormatError):

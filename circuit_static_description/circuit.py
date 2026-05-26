@@ -21,6 +21,14 @@ class _ExprNode:
     args: Tuple["_ExprNode", ...] = ()
     input_index: int | None = None
     variable_name: str | None = None
+    variable_index: int | None = None
+
+
+@dataclass(frozen=True)
+class _CompiledGraph:
+    variable_nodes: Tuple[_ExprNode, ...]
+    output_nodes: Tuple[_ExprNode, ...]
+    evaluation_order: Tuple[int, ...]
 
 
 class Circuit:
@@ -52,8 +60,7 @@ class Circuit:
         self.outputs = outputs or ["" for _ in range(output_count)]
         if len(self.outputs) != self.output_count:
             raise CircuitError("outputs length must match output_count")
-        self._parsed_variables: Dict[str, _ExprNode] | None = None
-        self._parsed_outputs: List[_ExprNode] | None = None
+        self._compiled_graph: _CompiledGraph | None = None
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -140,27 +147,39 @@ class Circuit:
             raise CircuitError(
                 f"Expected {self.input_count} input values, got {len(inputs)}"
             )
-        parsed_variables, parsed_outputs = self._ensure_parsed_graph()
-        variable_cache: Dict[str, bool] = {}
+        graph = self._ensure_compiled_graph()
+        variable_values = [False for _ in graph.variable_nodes]
+        for variable_index in graph.evaluation_order:
+            variable_values[variable_index] = _evaluate_compiled_tree(
+                graph.variable_nodes[variable_index],
+                inputs,
+                variable_values,
+            )
         return [
-            int(bool(_evaluate_tree(node, inputs, parsed_variables, variable_cache)))
-            for node in parsed_outputs
+            int(_evaluate_compiled_tree(node, inputs, variable_values))
+            for node in graph.output_nodes
         ]
 
     def _ensure_parsed_outputs(self) -> List[_ExprNode]:
-        _, parsed_outputs = self._ensure_parsed_graph()
-        return parsed_outputs
+        graph = self._ensure_compiled_graph()
+        return list(graph.output_nodes)
 
     def _ensure_parsed_graph(self) -> Tuple[Dict[str, _ExprNode], List[_ExprNode]]:
-        if self._parsed_variables is None or self._parsed_outputs is None:
+        graph = self._ensure_compiled_graph()
+        return (
+            {name: graph.variable_nodes[index] for index, (name, _) in enumerate(self.variables)},
+            list(graph.output_nodes),
+        )
+
+    def _ensure_compiled_graph(self) -> _CompiledGraph:
+        if self._compiled_graph is None:
             parsed_variables = {
                 name: self._parse_expression(expression) for name, expression in self.variables
             }
             parsed_outputs = [self._parse_expression(expression) for expression in self.outputs]
             self._validate_graph(parsed_variables, parsed_outputs)
-            self._parsed_variables = parsed_variables
-            self._parsed_outputs = parsed_outputs
-        return self._parsed_variables, self._parsed_outputs
+            self._compiled_graph = self._compile_graph(parsed_variables, parsed_outputs)
+        return self._compiled_graph
 
     def _parse_expression(self, text: str) -> _ExprNode:
         text = text.strip()
@@ -173,8 +192,15 @@ class Circuit:
         return node
 
     def _evaluate_node(self, node: _ExprNode, inputs: Sequence[Any]) -> bool:
-        parsed_variables, _ = self._ensure_parsed_graph()
-        return _evaluate_tree(node, inputs, parsed_variables, {})
+        graph = self._ensure_compiled_graph()
+        variable_values = [False for _ in graph.variable_nodes]
+        for variable_index in graph.evaluation_order:
+            variable_values[variable_index] = _evaluate_compiled_tree(
+                graph.variable_nodes[variable_index],
+                inputs,
+                variable_values,
+            )
+        return _evaluate_compiled_tree(node, inputs, variable_values)
 
     def _validate_graph(
         self,
@@ -209,6 +235,29 @@ class Circuit:
 
         for name in parsed_variables:
             visit_variable(name)
+
+    def _compile_graph(
+        self,
+        parsed_variables: Dict[str, _ExprNode],
+        parsed_outputs: List[_ExprNode],
+    ) -> _CompiledGraph:
+        variable_indices = {
+            name: index for index, (name, _) in enumerate(self.variables)
+        }
+        variable_nodes = [
+            _resolve_variable_references(parsed_variables[name], variable_indices)
+            for name, _ in self.variables
+        ]
+        output_nodes = [
+            _resolve_variable_references(node, variable_indices)
+            for node in parsed_outputs
+        ]
+        evaluation_order = _build_evaluation_order(parsed_variables, parsed_outputs, variable_indices)
+        return _CompiledGraph(
+            variable_nodes=tuple(variable_nodes),
+            output_nodes=tuple(output_nodes),
+            evaluation_order=tuple(evaluation_order),
+        )
 
     def _validate_expression_references(
         self,
@@ -279,11 +328,52 @@ def _iter_variable_references(node: _ExprNode) -> List[str]:
     return references
 
 
-def _evaluate_tree(
+def _resolve_variable_references(
+    node: _ExprNode,
+    variable_indices: Dict[str, int],
+) -> _ExprNode:
+    if node.op == "VARIABLE":
+        assert node.variable_name is not None
+        return _ExprNode(op="VARIABLE", variable_index=variable_indices[node.variable_name])
+    if not node.args:
+        return node
+    return _ExprNode(
+        op=node.op,
+        args=tuple(
+            _resolve_variable_references(child, variable_indices) for child in node.args
+        ),
+        input_index=node.input_index,
+        variable_name=node.variable_name,
+        variable_index=node.variable_index,
+    )
+
+
+def _build_evaluation_order(
+    parsed_variables: Dict[str, _ExprNode],
+    parsed_outputs: List[_ExprNode],
+    variable_indices: Dict[str, int],
+) -> List[int]:
+    order: List[int] = []
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        visited.add(name)
+        for dependency in _iter_variable_references(parsed_variables[name]):
+            visit(dependency)
+        order.append(variable_indices[name])
+
+    for output_node in parsed_outputs:
+        for reference in _iter_variable_references(output_node):
+            visit(reference)
+    return order
+
+
+def _evaluate_compiled_tree(
     node: _ExprNode,
     inputs: Sequence[Any],
-    variables: Dict[str, _ExprNode],
-    variable_cache: Dict[str, bool],
+    variable_values: Sequence[bool],
 ) -> bool:
     if node.op == "INPUT":
         assert node.input_index is not None
@@ -291,22 +381,11 @@ def _evaluate_tree(
             raise CircuitError(f"Input reference I{node.input_index} is out of range")
         return bool(inputs[node.input_index])
     if node.op == "VARIABLE":
-        assert node.variable_name is not None
-        if node.variable_name in variable_cache:
-            return variable_cache[node.variable_name]
-        if node.variable_name not in variables:
-            raise CircuitError(f"Variable reference {node.variable_name} is undefined")
-        value = _evaluate_tree(
-            variables[node.variable_name],
-            inputs,
-            variables,
-            variable_cache,
-        )
-        variable_cache[node.variable_name] = value
-        return value
+        assert node.variable_index is not None
+        return variable_values[node.variable_index]
 
     values = [
-        _evaluate_tree(child, inputs, variables, variable_cache) for child in node.args
+        _evaluate_compiled_tree(child, inputs, variable_values) for child in node.args
     ]
     if node.op == "AND":
         return values[0] and values[1]
