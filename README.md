@@ -21,19 +21,25 @@ from circuit_static_description import Circuit
 
 ### Circuit description format
 
-A circuit description contains only the number of inputs, the number of outputs, and the expression for each output. There are no intermediate variable names.
+A circuit description contains the number of inputs, the number of outputs, optional intermediate variables, and the expression for each output.
 
 - Input references use `I0`, `I1`, `I2`, etc.
+- Intermediate variables use `V0`, `V1`, `V2`, etc. Only `V` followed by an integer is accepted as a variable name.
+- Variable definitions use `V<number> = expression` and may reference inputs and earlier or later variables.
 - Output lines use fixed names `OUT0`, `OUT1`, etc.
+- Output definitions may reference inputs, variables, and supported logic operators.
 - Supported logic operators: `AND`, `OR`, `NOT`, `XOR`, `NAND`, `NOR`.
+- Circular variable dependencies and undefined variable references are rejected when the circuit is loaded or parsed.
 
 Example:
 
 ```text
 INPUTS 3
 OUTPUTS 2
-OUT0 = AND(I0, I1)
-OUT1 = NOR(I2, XOR(I0, I1))
+V0 = AND(I0, I1)
+V1 = XOR(V0, I2)
+OUT0 = V0
+OUT1 = NOR(I2, V1)
 ```
 
 ### Saving a circuit
@@ -44,9 +50,13 @@ from circuit_static_description import Circuit
 circuit = Circuit(
     input_count=3,
     output_count=2,
+    variables=[
+        ("V0", "AND(I0, I1)"),
+        ("V1", "XOR(V0, I2)"),
+    ],
     outputs=[
-        "AND(I0, I1)",
-        "NOR(I2, XOR(I0, I1))",
+        "V0",
+        "NOR(I2, V1)",
     ],
 )
 
@@ -73,7 +83,8 @@ print(result)
 
 - `evaluate` accepts a list of input values in input order.
 - The output is returned as a list of `0` or `1` values.
-- Expressions cannot use custom variable names; they must use `I*` input references and supported logic operators.
+- Custom variable names are not supported. Intermediate variables must be named `V0`, `V1`, `V2`, etc.
+- Old files without variable definitions still load normally.
 
 ## Benchmarking sequential evaluation
 
