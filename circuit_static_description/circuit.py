@@ -44,6 +44,7 @@ class Circuit:
         self.outputs = outputs or ["" for _ in range(output_count)]
         if len(self.outputs) != self.output_count:
             raise CircuitError("outputs length must match output_count")
+        self._parsed_outputs: List[_ExprNode] | None = None
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -102,8 +103,13 @@ class Circuit:
             raise CircuitError(
                 f"Expected {self.input_count} input values, got {len(inputs)}"
             )
-        parsed_outputs = [self._parse_expression(expression) for expression in self.outputs]
-        return [int(bool(self._evaluate_node(node, inputs))) for node in parsed_outputs]
+        parsed_outputs = self._ensure_parsed_outputs()
+        return [int(bool(_evaluate_tree(node, inputs))) for node in parsed_outputs]
+
+    def _ensure_parsed_outputs(self) -> List[_ExprNode]:
+        if self._parsed_outputs is None:
+            self._parsed_outputs = [self._parse_expression(expression) for expression in self.outputs]
+        return self._parsed_outputs
 
     def _parse_expression(self, text: str) -> _ExprNode:
         text = text.strip()
@@ -116,25 +122,29 @@ class Circuit:
         return node
 
     def _evaluate_node(self, node: _ExprNode, inputs: Sequence[Any]) -> bool:
-        if node.op == "INPUT":
-            assert node.input_index is not None
-            if node.input_index < 0 or node.input_index >= len(inputs):
-                raise CircuitError(f"Input reference I{node.input_index} is out of range")
-            return bool(inputs[node.input_index])
-        values = [self._evaluate_node(child, inputs) for child in node.args]
-        if node.op == "AND":
-            return values[0] and values[1]
-        if node.op == "OR":
-            return values[0] or values[1]
-        if node.op == "NOT":
-            return not values[0]
-        if node.op == "XOR":
-            return values[0] ^ values[1]
-        if node.op == "NAND":
-            return not (values[0] and values[1])
-        if node.op == "NOR":
-            return not (values[0] or values[1])
-        raise CircuitError(f"Unsupported operator during evaluation: {node.op}")
+        return _evaluate_tree(node, inputs)
+
+
+def _evaluate_tree(node: _ExprNode, inputs: Sequence[Any]) -> bool:
+    if node.op == "INPUT":
+        assert node.input_index is not None
+        if node.input_index < 0 or node.input_index >= len(inputs):
+            raise CircuitError(f"Input reference I{node.input_index} is out of range")
+        return bool(inputs[node.input_index])
+    values = [_evaluate_tree(child, inputs) for child in node.args]
+    if node.op == "AND":
+        return values[0] and values[1]
+    if node.op == "OR":
+        return values[0] or values[1]
+    if node.op == "NOT":
+        return not values[0]
+    if node.op == "XOR":
+        return values[0] ^ values[1]
+    if node.op == "NAND":
+        return not (values[0] and values[1])
+    if node.op == "NOR":
+        return not (values[0] or values[1])
+    raise CircuitError(f"Unsupported operator during evaluation: {node.op}")
 
 
 class _ExpressionParser:

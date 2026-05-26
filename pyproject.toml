@@ -1,11 +1,14 @@
 [tool.poetry]
 name = "circuit-static-description"
-version = "0.1.0"
+version = "0.1.1"
 description = "A boolean gate circuit description package for saving, loading, and evaluating logic circuits."
 authors = ["GGN_2015 <neko@jlulug.org>"]
 readme = "README.md"
 license = "MIT"
 keywords = ["circuit", "boolean", "logic"]
+packages = [
+  { include = "circuit_static_description" }
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -14,6 +17,9 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = "^3.11 || ^3.12"
+
+[tool.poetry.dev-dependencies]
+tqdm = "^4.67"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
