@@ -1,5 +1,6 @@
 import unittest
 import sys
+import time
 from pathlib import Path
 
 root_dir = Path(__file__).resolve().parents[1]
@@ -221,6 +222,15 @@ class CircuitVariableTests(unittest.TestCase):
 
 
 class CircuitSimplifyTests(unittest.TestCase):
+    @staticmethod
+    def _make_balanced_expression(depth: int, offset: int = 0) -> str:
+        if depth == 0:
+            return f"I{offset % 8}"
+        left = CircuitSimplifyTests._make_balanced_expression(depth - 1, offset)
+        right = CircuitSimplifyTests._make_balanced_expression(depth - 1, offset + 1)
+        operator = ["AND", "OR", "XOR", "NAND"][depth % 4]
+        return f"{operator}({left}, {right})"
+
     def test_simplify_folds_constants_and_boolean_identities(self) -> None:
         circuit = Circuit(
             input_count=2,
@@ -290,6 +300,45 @@ class CircuitSimplifyTests(unittest.TestCase):
             for right in [0, 1]:
                 inputs = [left, right]
                 self.assertEqual(simplified.evaluate(inputs), circuit.evaluate(inputs))
+
+    def test_simplify_hashes_commutative_subexpressions_canonically(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=2,
+            outputs=[
+                "XOR(AND(I0, I1), I0)",
+                "NAND(AND(I1, I0), I1)",
+            ],
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 2\nOUTPUTS 2\nV0 = AND(I0, I1)\n"
+            "OUT0 = XOR(V0, I0)\nOUT1 = NAND(V0, I1)\n",
+        )
+
+    def test_simplify_large_repeated_circuit_finishes_quickly(self) -> None:
+        shared = self._make_balanced_expression(depth=6)
+        outputs = []
+        for index in range(150):
+            outputs.append(f"XOR({shared}, I{index % 8})")
+            outputs.append(f"NAND({shared}, I{(index + 1) % 8})")
+        circuit = Circuit(input_count=8, output_count=len(outputs), outputs=outputs)
+
+        start = time.perf_counter()
+        simplified = circuit.simplify()
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(
+            elapsed,
+            4.0,
+            f"simplifying a large repeated circuit took {elapsed:.3f}s",
+        )
+        self.assertLess(len(simplified.variables), len(outputs))
+        inputs = [1, 0, 1, 1, 0, 1, 0, 1]
+        self.assertEqual(simplified.evaluate(inputs)[:8], circuit.evaluate(inputs)[:8])
 
     def test_simplify_reuses_old_variable_without_renumbering(self) -> None:
         circuit = Circuit(

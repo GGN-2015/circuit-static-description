@@ -473,34 +473,63 @@ def _not_node(node: _ExprNode) -> _ExprNode:
     return _ExprNode(op="NOT", args=(node,))
 
 
-def _node_key(node: _ExprNode) -> Tuple[Any, ...]:
-    if node.op == "INPUT":
-        return (node.op, node.input_index)
-    if node.op == "VARIABLE":
-        return (node.op, node.variable_name, node.variable_index)
-    if node.op == "CONSTANT":
-        return (node.op, node.constant_value)
+_ExprFingerprint = Tuple[str, int, int]
 
-    child_keys = tuple(_node_key(child) for child in node.args)
-    if node.op in {"AND", "OR", "XOR", "NAND", "NOR"}:
-        child_keys = tuple(sorted(child_keys))
-    return (node.op, child_keys)
+
+class _ExpressionHasher:
+    COMMUTATIVE_OPS = {"AND", "OR", "XOR", "NAND", "NOR"}
+
+    def __init__(self) -> None:
+        self._cache: Dict[int, _ExprFingerprint] = {}
+
+    def fingerprint(self, node: _ExprNode) -> _ExprFingerprint:
+        node_id = id(node)
+        cached = self._cache.get(node_id)
+        if cached is not None:
+            return cached
+
+        if node.op == "INPUT":
+            fingerprint = (node.op, hash((node.op, node.input_index)), 1)
+        elif node.op == "VARIABLE":
+            fingerprint = (
+                node.op,
+                hash((node.op, node.variable_name, node.variable_index)),
+                1,
+            )
+        elif node.op == "CONSTANT":
+            fingerprint = (node.op, hash((node.op, node.constant_value)), 1)
+        else:
+            child_fingerprints = [self.fingerprint(child) for child in node.args]
+            if node.op in self.COMMUTATIVE_OPS:
+                child_fingerprints.sort()
+            fingerprint = (
+                node.op,
+                hash((node.op, tuple(child_fingerprints))),
+                1 + sum(child[2] for child in child_fingerprints),
+            )
+
+        self._cache[node_id] = fingerprint
+        return fingerprint
 
 
 def _constant_value(node: _ExprNode) -> bool | None:
     return node.constant_value if node.op == "CONSTANT" else None
 
 
-def _is_same_expr(left: _ExprNode, right: _ExprNode) -> bool:
-    return _node_key(left) == _node_key(right)
+def _is_same_expr(left: _ExprNode, right: _ExprNode, hasher: _ExpressionHasher) -> bool:
+    return hasher.fingerprint(left) == hasher.fingerprint(right)
 
 
-def _is_not_of(node: _ExprNode, other: _ExprNode) -> bool:
-    return node.op == "NOT" and len(node.args) == 1 and _is_same_expr(node.args[0], other)
+def _is_not_of(node: _ExprNode, other: _ExprNode, hasher: _ExpressionHasher) -> bool:
+    return (
+        node.op == "NOT"
+        and len(node.args) == 1
+        and _is_same_expr(node.args[0], other, hasher)
+    )
 
 
-def _are_complements(left: _ExprNode, right: _ExprNode) -> bool:
-    return _is_not_of(left, right) or _is_not_of(right, left)
+def _are_complements(left: _ExprNode, right: _ExprNode, hasher: _ExpressionHasher) -> bool:
+    return _is_not_of(left, right, hasher) or _is_not_of(right, left, hasher)
 
 
 def _evaluate_constant_operator(operator: str, values: Sequence[bool]) -> bool:
@@ -519,11 +548,16 @@ def _evaluate_constant_operator(operator: str, values: Sequence[bool]) -> bool:
     raise CircuitError(f"Unsupported operator during simplification: {operator}")
 
 
-def _simplify_expr_node(node: _ExprNode) -> _ExprNode:
+def _simplify_expr_node(
+    node: _ExprNode,
+    hasher: _ExpressionHasher | None = None,
+) -> _ExprNode:
+    if hasher is None:
+        hasher = _ExpressionHasher()
     if node.op in {"INPUT", "VARIABLE", "CONSTANT"}:
         return node
 
-    args = tuple(_simplify_expr_node(child) for child in node.args)
+    args = tuple(_simplify_expr_node(child, hasher) for child in node.args)
     constant_values = [_constant_value(child) for child in args]
     if all(value is not None for value in constant_values):
         return _constant_node(
@@ -547,9 +581,9 @@ def _simplify_expr_node(node: _ExprNode) -> _ExprNode:
             return right
         if right_constant is True:
             return left
-        if _is_same_expr(left, right):
+        if _is_same_expr(left, right, hasher):
             return left
-        if _are_complements(left, right):
+        if _are_complements(left, right, hasher):
             return _constant_node(False)
 
     if node.op == "OR":
@@ -559,9 +593,9 @@ def _simplify_expr_node(node: _ExprNode) -> _ExprNode:
             return right
         if right_constant is False:
             return left
-        if _is_same_expr(left, right):
+        if _is_same_expr(left, right, hasher):
             return left
-        if _are_complements(left, right):
+        if _are_complements(left, right, hasher):
             return _constant_node(True)
 
     if node.op == "XOR":
@@ -570,36 +604,36 @@ def _simplify_expr_node(node: _ExprNode) -> _ExprNode:
         if right_constant is False:
             return left
         if left_constant is True:
-            return _simplify_expr_node(_not_node(right))
+            return _simplify_expr_node(_not_node(right), hasher)
         if right_constant is True:
-            return _simplify_expr_node(_not_node(left))
-        if _is_same_expr(left, right):
+            return _simplify_expr_node(_not_node(left), hasher)
+        if _is_same_expr(left, right, hasher):
             return _constant_node(False)
-        if _are_complements(left, right):
+        if _are_complements(left, right, hasher):
             return _constant_node(True)
 
     if node.op == "NAND":
         if left_constant is False or right_constant is False:
             return _constant_node(True)
         if left_constant is True:
-            return _simplify_expr_node(_not_node(right))
+            return _simplify_expr_node(_not_node(right), hasher)
         if right_constant is True:
-            return _simplify_expr_node(_not_node(left))
-        if _is_same_expr(left, right):
-            return _simplify_expr_node(_not_node(left))
-        if _are_complements(left, right):
+            return _simplify_expr_node(_not_node(left), hasher)
+        if _is_same_expr(left, right, hasher):
+            return _simplify_expr_node(_not_node(left), hasher)
+        if _are_complements(left, right, hasher):
             return _constant_node(True)
 
     if node.op == "NOR":
         if left_constant is True or right_constant is True:
             return _constant_node(False)
         if left_constant is False:
-            return _simplify_expr_node(_not_node(right))
+            return _simplify_expr_node(_not_node(right), hasher)
         if right_constant is False:
-            return _simplify_expr_node(_not_node(left))
-        if _is_same_expr(left, right):
-            return _simplify_expr_node(_not_node(left))
-        if _are_complements(left, right):
+            return _simplify_expr_node(_not_node(left), hasher)
+        if _is_same_expr(left, right, hasher):
+            return _simplify_expr_node(_not_node(left), hasher)
+        if _are_complements(left, right, hasher):
             return _constant_node(False)
 
     return _ExprNode(op=node.op, args=args)
@@ -611,15 +645,16 @@ def _is_extractable_subexpression(node: _ExprNode) -> bool:
 
 def _collect_subexpression_counts(
     node: _ExprNode,
-    counts: Dict[Tuple[Any, ...], int],
-    examples: Dict[Tuple[Any, ...], _ExprNode],
+    counts: Dict[_ExprFingerprint, int],
+    examples: Dict[_ExprFingerprint, _ExprNode],
+    hasher: _ExpressionHasher,
 ) -> None:
     if _is_extractable_subexpression(node):
-        key = _node_key(node)
+        key = hasher.fingerprint(node)
         counts[key] = counts.get(key, 0) + 1
         examples.setdefault(key, node)
     for child in node.args:
-        _collect_subexpression_counts(child, counts, examples)
+        _collect_subexpression_counts(child, counts, examples, hasher)
 
 
 def _extract_repeated_subexpressions(
@@ -627,18 +662,19 @@ def _extract_repeated_subexpressions(
     simplified_variables: Dict[str, _ExprNode],
     simplified_outputs: Sequence[_ExprNode],
 ) -> Tuple[List[Tuple[str, str]], List[str]]:
-    counts: Dict[Tuple[Any, ...], int] = {}
-    examples: Dict[Tuple[Any, ...], _ExprNode] = {}
+    hasher = _ExpressionHasher()
+    counts: Dict[_ExprFingerprint, int] = {}
+    examples: Dict[_ExprFingerprint, _ExprNode] = {}
     for name, _ in original_variables:
-        _collect_subexpression_counts(simplified_variables[name], counts, examples)
+        _collect_subexpression_counts(simplified_variables[name], counts, examples, hasher)
     for node in simplified_outputs:
-        _collect_subexpression_counts(node, counts, examples)
+        _collect_subexpression_counts(node, counts, examples, hasher)
 
-    replacements: Dict[Tuple[Any, ...], str] = {}
+    replacements: Dict[_ExprFingerprint, str] = {}
     for name, _ in original_variables:
         node = simplified_variables[name]
         if _is_extractable_subexpression(node):
-            replacements.setdefault(_node_key(node), name)
+            replacements.setdefault(hasher.fingerprint(node), name)
 
     new_variable_nodes: List[Tuple[str, _ExprNode]] = []
     used_numbers = {_variable_number_from_name(name) for name, _ in original_variables}
@@ -650,7 +686,7 @@ def _extract_repeated_subexpressions(
         new_variable_nodes.append((name, examples[key]))
 
     def replace(node: _ExprNode, protected_name: str | None = None) -> _ExprNode:
-        key = _node_key(node)
+        key = hasher.fingerprint(node)
         replacement_name = replacements.get(key)
         if replacement_name is not None and replacement_name != protected_name:
             return _ExprNode(op="VARIABLE", variable_name=replacement_name)
