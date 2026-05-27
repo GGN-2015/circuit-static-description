@@ -63,6 +63,40 @@ class CircuitVariableTests(unittest.TestCase):
 
         self.assertEqual(circuit.evaluate([1, 1]), [0])
 
+    def test_boolean_literals_work_in_all_expression_positions(self) -> None:
+        circuit = Circuit.from_text(
+            """
+            INPUTS 1
+            OUTPUTS 4
+            V0 = True
+            V1 = false
+            OUT0 = V0
+            OUT1 = V1
+            OUT2 = AND(TRUE, I0)
+            OUT3 = OR(False, I0)
+            """
+        )
+
+        self.assertEqual(circuit.evaluate([0]), [1, 0, 0, 0])
+        self.assertEqual(circuit.evaluate([1]), [1, 0, 1, 1])
+        self.assertEqual(circuit.evaluate([1], targets=["V0", "V1"]), [1, 0])
+
+    def test_constructor_accepts_boolean_literals(self) -> None:
+        circuit = Circuit(
+            input_count=1,
+            output_count=3,
+            variables={"V0": False},
+            outputs=[True, "V0", "XOR(True, I0)"],
+        )
+
+        self.assertEqual(
+            circuit.to_text(),
+            "INPUTS 1\nOUTPUTS 3\nV0 = False\nOUT0 = True\n"
+            "OUT1 = V0\nOUT2 = XOR(True, I0)\n",
+        )
+        self.assertEqual(circuit.evaluate([0]), [1, 0, 1])
+        self.assertEqual(circuit.evaluate([1]), [1, 0, 0])
+
     def test_evaluate_reuses_compiled_graph_after_first_parse(self) -> None:
         circuit = Circuit(
             input_count=2,
@@ -186,6 +220,141 @@ class CircuitVariableTests(unittest.TestCase):
             Circuit(input_count=1, output_count=1, variables={"A0": "I0"}, outputs=["I0"])
 
 
+class CircuitSimplifyTests(unittest.TestCase):
+    def test_simplify_folds_constants_and_boolean_identities(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=8,
+            outputs=[
+                "AND(True, I0)",
+                "AND(False, I0)",
+                "OR(False, I1)",
+                "OR(True, I1)",
+                "XOR(True, I0)",
+                "XOR(False, I1)",
+                "NAND(True, I0)",
+                "NOR(False, I1)",
+            ],
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 2\nOUTPUTS 8\nV0 = NOT(I0)\nOUT0 = I0\nOUT1 = False\n"
+            "OUT2 = I1\nOUT3 = True\nOUT4 = V0\nOUT5 = I1\nOUT6 = V0\n"
+            "OUT7 = NOT(I1)\n",
+        )
+        for left in [0, 1]:
+            for right in [0, 1]:
+                inputs = [left, right]
+                self.assertEqual(simplified.evaluate(inputs), circuit.evaluate(inputs))
+
+    def test_simplify_evaluates_all_constant_subtrees(self) -> None:
+        circuit = Circuit(
+            input_count=1,
+            output_count=2,
+            outputs=[
+                "AND(OR(True, False), NOT(False))",
+                "XOR(NAND(True, True), NOR(False, False))",
+            ],
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 1\nOUTPUTS 2\nOUT0 = True\nOUT1 = True\n",
+        )
+        self.assertEqual(simplified.evaluate([0]), circuit.evaluate([0]))
+
+    def test_simplify_extracts_repeated_subexpressions_to_new_variables(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=2,
+            variables=[("V0", "I0")],
+            outputs=[
+                "XOR(AND(I0, I1), I0)",
+                "NAND(AND(I0, I1), I1)",
+            ],
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 2\nOUTPUTS 2\nV0 = I0\nV1 = AND(I0, I1)\n"
+            "OUT0 = XOR(V1, I0)\nOUT1 = NAND(V1, I1)\n",
+        )
+        for left in [0, 1]:
+            for right in [0, 1]:
+                inputs = [left, right]
+                self.assertEqual(simplified.evaluate(inputs), circuit.evaluate(inputs))
+
+    def test_simplify_reuses_old_variable_without_renumbering(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=2,
+            variables=[
+                ("V3", "AND(I0, I1)"),
+            ],
+            outputs=[
+                "XOR(AND(I0, I1), I0)",
+                "NAND(AND(I0, I1), I1)",
+            ],
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 2\nOUTPUTS 2\nV3 = AND(I0, I1)\n"
+            "OUT0 = XOR(V3, I0)\nOUT1 = NAND(V3, I1)\n",
+        )
+        self.assertEqual(simplified.evaluate([1, 1], targets="V3"), [1])
+
+    def test_simplify_can_reuse_duplicate_old_variable_expressions(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=1,
+            variables=[
+                ("V0", "AND(I0, I1)"),
+                ("V2", "AND(I0, I1)"),
+            ],
+            outputs=["V2"],
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 2\nOUTPUTS 1\nV0 = AND(I0, I1)\nV2 = V0\nOUT0 = V2\n",
+        )
+        self.assertEqual(simplified.evaluate([1, 1], targets=["V0", "V2", "OUT0"]), [1, 1, 1])
+
+    def test_save_simplifies_by_default_and_can_be_disabled(self) -> None:
+        circuit = Circuit(
+            input_count=2,
+            output_count=1,
+            outputs=["AND(True, AND(I0, I1))"],
+        )
+        temp_dir = Path(__file__).resolve().parent
+        simplified_path = temp_dir / "_tmp_simplified.circuit"
+        raw_path = temp_dir / "_tmp_raw.circuit"
+        try:
+            circuit.save(simplified_path, mode="text")
+            circuit.save(raw_path, mode="text", simplify=False)
+
+            self.assertIn("OUT0 = AND(I0, I1)", simplified_path.read_text("utf-8"))
+            self.assertIn(
+                "OUT0 = AND(True, AND(I0, I1))",
+                raw_path.read_text("utf-8"),
+            )
+        finally:
+            simplified_path.unlink(missing_ok=True)
+            raw_path.unlink(missing_ok=True)
+
+
 class CircuitBinaryFormatTests(unittest.TestCase):
     def test_binary_round_trip_preserves_behavior_and_text_shape(self) -> None:
         circuit = Circuit(
@@ -209,6 +378,27 @@ class CircuitBinaryFormatTests(unittest.TestCase):
         self.assertEqual(loaded.evaluate([1, 1, 0]), circuit.evaluate([1, 1, 0]))
         self.assertEqual(loaded.evaluate([1, 0, 1]), circuit.evaluate([1, 0, 1]))
         self.assertEqual(loaded.evaluate([1, 1, 0], targets=["V3", "V1"]), [1, 1])
+
+    def test_binary_round_trip_preserves_boolean_literals(self) -> None:
+        circuit = Circuit(
+            input_count=1,
+            output_count=3,
+            variables=[
+                ("V0", "True"),
+                ("V1", "False"),
+            ],
+            outputs=[
+                "V0",
+                "V1",
+                "AND(True, I0)",
+            ],
+        )
+
+        loaded = Circuit.from_binary(circuit.to_binary())
+
+        self.assertEqual(loaded.to_text(), circuit.to_text())
+        self.assertEqual(loaded.evaluate([0]), [1, 0, 0])
+        self.assertEqual(loaded.evaluate([1]), [1, 0, 1])
 
     def test_load_auto_detects_binary_or_text_files(self) -> None:
         circuit = Circuit(

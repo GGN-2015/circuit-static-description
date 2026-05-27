@@ -36,6 +36,7 @@ The text description contains the number of inputs, the number of outputs, optio
 - Variable definitions use `V<number> = expression` and may reference inputs and earlier or later variables.
 - Output lines use fixed names `OUT0`, `OUT1`, etc.
 - Output definitions may reference inputs, variables, and supported logic operators.
+- Boolean literals `True` and `False` are accepted anywhere an expression is accepted. Literal parsing is case-insensitive.
 - Supported logic operators: `AND`, `OR`, `NOT`, `XOR`, `NAND`, `NOR`.
 - Circular variable dependencies and undefined variable references are rejected when the circuit is loaded or parsed.
 
@@ -48,7 +49,7 @@ OUTPUTS 2
 V0 = AND(I0, I1)
 V1 = XOR(V0, I2)
 OUT0 = V0
-OUT1 = NOR(I2, V1)  # trailing comments are allowed
+OUT1 = NOR(False, V1)  # trailing comments are allowed
 ```
 
 ### Saving a circuit
@@ -73,6 +74,20 @@ circuit.save("example.circuit")  # binary by default
 circuit.save("example-text.circuit", mode="text")
 circuit.save("example-binary.circuit", mode="binary")
 ```
+
+`save(...)` simplifies the circuit before writing by default. Pass `simplify=False` to preserve the original expression text:
+
+```python
+circuit.save("example-text.circuit", mode="text", simplify=False)
+```
+
+You can also simplify manually. `simplify()` returns a new `Circuit` and leaves the original object unchanged.
+
+```python
+simplified = circuit.simplify()
+```
+
+Simplification folds constant-only logic, applies boolean identities such as `AND(True, X) = X` and `XOR(True, X) = NOT(X)`, and extracts repeated gate expressions into new intermediate variables. Existing variable names keep their original `V<number>` names.
 
 ### Loading a circuit
 

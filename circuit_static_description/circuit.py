@@ -11,6 +11,8 @@ _BINARY_VERSION = 1
 _MAX_VARUINT_BYTES = 10
 _INPUT_OPCODE = 0x00
 _VARIABLE_OPCODE = 0x01
+_FALSE_OPCODE = 0x02
+_TRUE_OPCODE = 0x03
 _OP_TO_OPCODE = {
     "AND": 0x10,
     "OR": 0x11,
@@ -37,6 +39,7 @@ class _ExprNode:
     input_index: int | None = None
     variable_name: str | None = None
     variable_index: int | None = None
+    constant_value: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -62,8 +65,10 @@ class Circuit:
         self,
         input_count: int,
         output_count: int,
-        outputs: List[str] | None = None,
-        variables: Mapping[str, str] | Sequence[Tuple[str, str]] | None = None,
+        outputs: Sequence[str | bool] | None = None,
+        variables: (
+            Mapping[str, str | bool] | Sequence[Tuple[str, str | bool]] | None
+        ) = None,
     ) -> None:
         if input_count < 1:
             raise CircuitError("input_count must be at least 1")
@@ -72,23 +77,30 @@ class Circuit:
         self.input_count = input_count
         self.output_count = output_count
         self.variables = _normalize_variables(variables)
-        self.outputs = outputs or ["" for _ in range(output_count)]
+        self.outputs = (
+            [_normalize_expression(expression, "Output expression") for expression in outputs]
+            if outputs is not None
+            else ["" for _ in range(output_count)]
+        )
         if len(self.outputs) != self.output_count:
             raise CircuitError("outputs length must match output_count")
         self._compiled_graph: _CompiledGraph | None = None
 
-    def save(self, path: str | Path, mode: str = "binary") -> None:
+    def save(self, path: str | Path, mode: str = "binary", simplify: bool = True) -> None:
         path = Path(path)
         normalized_mode = mode.lower()
+        circuit = self.simplify() if simplify else self
         if normalized_mode in {"binary", "bin"}:
-            path.write_bytes(self.to_binary())
+            path.write_bytes(circuit.to_binary())
             return
         if normalized_mode in {"text", "txt"}:
-            path.write_text(self.to_text(), encoding="utf-8")
+            path.write_text(circuit.to_text(), encoding="utf-8")
             return
         raise CircuitError("mode must be 'binary' or 'text'")
 
-    def to_text(self) -> str:
+    def to_text(self, simplify: bool = False) -> str:
+        if simplify:
+            return self.simplify().to_text()
         lines: List[str] = [f"INPUTS {self.input_count}", f"OUTPUTS {self.output_count}"]
         for name, expression in self.variables:
             lines.append(f"{name} = {expression}")
@@ -96,7 +108,9 @@ class Circuit:
             lines.append(f"OUT{index} = {expression}")
         return "\n".join(lines) + "\n"
 
-    def to_binary(self) -> bytes:
+    def to_binary(self, simplify: bool = False) -> bytes:
+        if simplify:
+            return self.simplify().to_binary()
         graph = self._ensure_compiled_graph()
         writer = _BinaryWriter()
         writer.write_bytes(_BINARY_MAGIC)
@@ -111,6 +125,31 @@ class Circuit:
         for node in graph.output_nodes:
             _write_expr_node(writer, node, self.variables)
         return writer.to_bytes()
+
+    def simplify(self) -> "Circuit":
+        parsed_variables = {
+            name: self._parse_expression(expression) for name, expression in self.variables
+        }
+        parsed_outputs = [self._parse_expression(expression) for expression in self.outputs]
+        self._validate_graph(parsed_variables, parsed_outputs)
+
+        simplified_variables = {
+            name: _simplify_expr_node(node) for name, node in parsed_variables.items()
+        }
+        simplified_outputs = [_simplify_expr_node(node) for node in parsed_outputs]
+        variables, outputs = _extract_repeated_subexpressions(
+            self.variables,
+            simplified_variables,
+            simplified_outputs,
+        )
+        simplified = Circuit(
+            input_count=self.input_count,
+            output_count=self.output_count,
+            outputs=outputs,
+            variables=variables,
+        )
+        simplified._ensure_compiled_graph()
+        return simplified
 
     @classmethod
     def load(cls, path: str | Path) -> "Circuit":
@@ -395,7 +434,7 @@ class Circuit:
 
 
 def _normalize_variables(
-    variables: Mapping[str, str] | Sequence[Tuple[str, str]] | None,
+    variables: Mapping[str, str | bool] | Sequence[Tuple[str, str | bool]] | None,
 ) -> List[Tuple[str, str]]:
     if variables is None:
         return []
@@ -408,11 +447,241 @@ def _normalize_variables(
             raise CircuitError(f"Invalid variable name '{name}'; expected V<number>")
         if normalized_name in seen:
             raise CircuitError(f"Duplicate variable definition: {normalized_name}")
-        if not isinstance(expression, str) or not expression.strip():
-            raise CircuitError(f"Expression for {normalized_name} cannot be empty")
-        normalized_variables.append((normalized_name, expression.strip()))
+        normalized_variables.append(
+            (
+                normalized_name,
+                _normalize_expression(expression, f"Expression for {normalized_name}"),
+            )
+        )
         seen.add(normalized_name)
     return normalized_variables
+
+
+def _normalize_expression(expression: str | bool, owner: str) -> str:
+    if isinstance(expression, bool):
+        return "True" if expression else "False"
+    if not isinstance(expression, str) or not expression.strip():
+        raise CircuitError(f"{owner} cannot be empty")
+    return expression.strip()
+
+
+def _constant_node(value: bool) -> _ExprNode:
+    return _ExprNode(op="CONSTANT", constant_value=value)
+
+
+def _not_node(node: _ExprNode) -> _ExprNode:
+    return _ExprNode(op="NOT", args=(node,))
+
+
+def _node_key(node: _ExprNode) -> Tuple[Any, ...]:
+    if node.op == "INPUT":
+        return (node.op, node.input_index)
+    if node.op == "VARIABLE":
+        return (node.op, node.variable_name, node.variable_index)
+    if node.op == "CONSTANT":
+        return (node.op, node.constant_value)
+
+    child_keys = tuple(_node_key(child) for child in node.args)
+    if node.op in {"AND", "OR", "XOR", "NAND", "NOR"}:
+        child_keys = tuple(sorted(child_keys))
+    return (node.op, child_keys)
+
+
+def _constant_value(node: _ExprNode) -> bool | None:
+    return node.constant_value if node.op == "CONSTANT" else None
+
+
+def _is_same_expr(left: _ExprNode, right: _ExprNode) -> bool:
+    return _node_key(left) == _node_key(right)
+
+
+def _is_not_of(node: _ExprNode, other: _ExprNode) -> bool:
+    return node.op == "NOT" and len(node.args) == 1 and _is_same_expr(node.args[0], other)
+
+
+def _are_complements(left: _ExprNode, right: _ExprNode) -> bool:
+    return _is_not_of(left, right) or _is_not_of(right, left)
+
+
+def _evaluate_constant_operator(operator: str, values: Sequence[bool]) -> bool:
+    if operator == "AND":
+        return values[0] and values[1]
+    if operator == "OR":
+        return values[0] or values[1]
+    if operator == "NOT":
+        return not values[0]
+    if operator == "XOR":
+        return values[0] ^ values[1]
+    if operator == "NAND":
+        return not (values[0] and values[1])
+    if operator == "NOR":
+        return not (values[0] or values[1])
+    raise CircuitError(f"Unsupported operator during simplification: {operator}")
+
+
+def _simplify_expr_node(node: _ExprNode) -> _ExprNode:
+    if node.op in {"INPUT", "VARIABLE", "CONSTANT"}:
+        return node
+
+    args = tuple(_simplify_expr_node(child) for child in node.args)
+    constant_values = [_constant_value(child) for child in args]
+    if all(value is not None for value in constant_values):
+        return _constant_node(
+            _evaluate_constant_operator(node.op, [bool(value) for value in constant_values])
+        )
+
+    if node.op == "NOT":
+        child = args[0]
+        if child.op == "NOT":
+            return child.args[0]
+        return _ExprNode(op="NOT", args=(child,))
+
+    left, right = args
+    left_constant = _constant_value(left)
+    right_constant = _constant_value(right)
+
+    if node.op == "AND":
+        if left_constant is False or right_constant is False:
+            return _constant_node(False)
+        if left_constant is True:
+            return right
+        if right_constant is True:
+            return left
+        if _is_same_expr(left, right):
+            return left
+        if _are_complements(left, right):
+            return _constant_node(False)
+
+    if node.op == "OR":
+        if left_constant is True or right_constant is True:
+            return _constant_node(True)
+        if left_constant is False:
+            return right
+        if right_constant is False:
+            return left
+        if _is_same_expr(left, right):
+            return left
+        if _are_complements(left, right):
+            return _constant_node(True)
+
+    if node.op == "XOR":
+        if left_constant is False:
+            return right
+        if right_constant is False:
+            return left
+        if left_constant is True:
+            return _simplify_expr_node(_not_node(right))
+        if right_constant is True:
+            return _simplify_expr_node(_not_node(left))
+        if _is_same_expr(left, right):
+            return _constant_node(False)
+        if _are_complements(left, right):
+            return _constant_node(True)
+
+    if node.op == "NAND":
+        if left_constant is False or right_constant is False:
+            return _constant_node(True)
+        if left_constant is True:
+            return _simplify_expr_node(_not_node(right))
+        if right_constant is True:
+            return _simplify_expr_node(_not_node(left))
+        if _is_same_expr(left, right):
+            return _simplify_expr_node(_not_node(left))
+        if _are_complements(left, right):
+            return _constant_node(True)
+
+    if node.op == "NOR":
+        if left_constant is True or right_constant is True:
+            return _constant_node(False)
+        if left_constant is False:
+            return _simplify_expr_node(_not_node(right))
+        if right_constant is False:
+            return _simplify_expr_node(_not_node(left))
+        if _is_same_expr(left, right):
+            return _simplify_expr_node(_not_node(left))
+        if _are_complements(left, right):
+            return _constant_node(False)
+
+    return _ExprNode(op=node.op, args=args)
+
+
+def _is_extractable_subexpression(node: _ExprNode) -> bool:
+    return node.op in Circuit.SUPPORTED_OPS
+
+
+def _collect_subexpression_counts(
+    node: _ExprNode,
+    counts: Dict[Tuple[Any, ...], int],
+    examples: Dict[Tuple[Any, ...], _ExprNode],
+) -> None:
+    if _is_extractable_subexpression(node):
+        key = _node_key(node)
+        counts[key] = counts.get(key, 0) + 1
+        examples.setdefault(key, node)
+    for child in node.args:
+        _collect_subexpression_counts(child, counts, examples)
+
+
+def _extract_repeated_subexpressions(
+    original_variables: Sequence[Tuple[str, str]],
+    simplified_variables: Dict[str, _ExprNode],
+    simplified_outputs: Sequence[_ExprNode],
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    counts: Dict[Tuple[Any, ...], int] = {}
+    examples: Dict[Tuple[Any, ...], _ExprNode] = {}
+    for name, _ in original_variables:
+        _collect_subexpression_counts(simplified_variables[name], counts, examples)
+    for node in simplified_outputs:
+        _collect_subexpression_counts(node, counts, examples)
+
+    replacements: Dict[Tuple[Any, ...], str] = {}
+    for name, _ in original_variables:
+        node = simplified_variables[name]
+        if _is_extractable_subexpression(node):
+            replacements.setdefault(_node_key(node), name)
+
+    new_variable_nodes: List[Tuple[str, _ExprNode]] = []
+    used_numbers = {_variable_number_from_name(name) for name, _ in original_variables}
+    for key, count in counts.items():
+        if count < 2 or key in replacements:
+            continue
+        name = _next_variable_name(used_numbers)
+        replacements[key] = name
+        new_variable_nodes.append((name, examples[key]))
+
+    def replace(node: _ExprNode, protected_name: str | None = None) -> _ExprNode:
+        key = _node_key(node)
+        replacement_name = replacements.get(key)
+        if replacement_name is not None and replacement_name != protected_name:
+            return _ExprNode(op="VARIABLE", variable_name=replacement_name)
+        if not node.args:
+            return node
+        return _ExprNode(
+            op=node.op,
+            args=tuple(replace(child) for child in node.args),
+            input_index=node.input_index,
+            variable_name=node.variable_name,
+            variable_index=node.variable_index,
+            constant_value=node.constant_value,
+        )
+
+    variables: List[Tuple[str, str]] = []
+    for name, _ in original_variables:
+        node = simplified_variables[name]
+        variables.append((name, _expr_node_to_text(replace(node, name))))
+    for name, node in new_variable_nodes:
+        variables.append((name, _expr_node_to_text(replace(node, name))))
+
+    outputs = [_expr_node_to_text(replace(node)) for node in simplified_outputs]
+    return variables, outputs
+
+
+def _next_variable_name(used_numbers: set[int]) -> str:
+    number = max(used_numbers, default=-1) + 1
+    while number in used_numbers:
+        number += 1
+    used_numbers.add(number)
+    return f"V{number}"
 
 
 def _is_variable_name(name: str) -> bool:
@@ -458,6 +727,7 @@ def _resolve_variable_references(
         input_index=node.input_index,
         variable_name=node.variable_name,
         variable_index=node.variable_index,
+        constant_value=node.constant_value,
     )
 
 
@@ -541,6 +811,9 @@ def _evaluate_compiled_tree(
     if node.op == "VARIABLE":
         assert node.variable_index is not None
         return variable_values[node.variable_index]
+    if node.op == "CONSTANT":
+        assert node.constant_value is not None
+        return node.constant_value
 
     values = [
         _evaluate_compiled_tree(child, inputs, variable_values) for child in node.args
@@ -580,6 +853,10 @@ class _ExpressionParser:
         self._skip_whitespace()
         if self._peek().isalpha():
             token = self._parse_identifier().upper()
+            if token == "TRUE":
+                return _ExprNode(op="CONSTANT", constant_value=True)
+            if token == "FALSE":
+                return _ExprNode(op="CONSTANT", constant_value=False)
             if token.startswith("I") and token[1:].isdigit():
                 index = int(token[1:])
                 if index < 0:
@@ -604,7 +881,8 @@ class _ExpressionParser:
                 )
             return _ExprNode(op=token, args=tuple(args))
         raise CircuitFormatError(
-            "Expression must begin with an input reference, variable reference, or operator"
+            "Expression must begin with a boolean literal, input reference, "
+            "variable reference, or operator"
         )
 
     def _parse_arguments(self, operator: str) -> List[_ExprNode]:
@@ -666,6 +944,10 @@ def _write_expr_node(
         assert node.variable_index is not None
         writer.write_varuint(_variable_number_from_name(variables[node.variable_index][0]))
         return
+    if node.op == "CONSTANT":
+        assert node.constant_value is not None
+        writer.write_byte(_TRUE_OPCODE if node.constant_value else _FALSE_OPCODE)
+        return
 
     opcode = _OP_TO_OPCODE.get(node.op)
     if opcode is None:
@@ -681,6 +963,10 @@ def _read_expr_node(reader: "_BinaryReader") -> _ExprNode:
         return _ExprNode(op="INPUT", input_index=reader.read_varuint())
     if opcode == _VARIABLE_OPCODE:
         return _ExprNode(op="VARIABLE", variable_name=f"V{reader.read_varuint()}")
+    if opcode == _FALSE_OPCODE:
+        return _ExprNode(op="CONSTANT", constant_value=False)
+    if opcode == _TRUE_OPCODE:
+        return _ExprNode(op="CONSTANT", constant_value=True)
 
     op = _OPCODE_TO_OP.get(opcode)
     if op is None:
@@ -701,6 +987,9 @@ def _expr_node_to_text(node: _ExprNode) -> str:
             return node.variable_name
         assert node.variable_index is not None
         return f"V{node.variable_index}"
+    if node.op == "CONSTANT":
+        assert node.constant_value is not None
+        return "True" if node.constant_value else "False"
 
     if node.op not in Circuit.SUPPORTED_OPS:
         raise CircuitFormatError(f"Unsupported operator in binary expression: {node.op}")
