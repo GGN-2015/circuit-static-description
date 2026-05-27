@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Sequence, Tuple
 
 _BINARY_MAGIC = b"CSDCIR\x00"
 _BINARY_VERSION = 1
@@ -133,10 +133,11 @@ class Circuit:
         parsed_outputs = [self._parse_expression(expression) for expression in self.outputs]
         self._validate_graph(parsed_variables, parsed_outputs)
 
+        hasher = _ExpressionHasher()
         simplified_variables = {
-            name: _simplify_expr_node(node) for name, node in parsed_variables.items()
+            name: _simplify_expr_node(node, hasher) for name, node in parsed_variables.items()
         }
-        simplified_outputs = [_simplify_expr_node(node) for node in parsed_outputs]
+        simplified_outputs = [_simplify_expr_node(node, hasher) for node in parsed_outputs]
         variables, outputs = _extract_repeated_subexpressions(
             self.variables,
             simplified_variables,
@@ -417,7 +418,7 @@ class Circuit:
         parsed_variables: Dict[str, _ExprNode],
         owner: str,
     ) -> None:
-        for child in _walk_tree(node):
+        for child in _iter_tree(node):
             if child.op == "INPUT":
                 assert child.input_index is not None
                 if child.input_index < 0 or child.input_index >= self.input_count:
@@ -473,42 +474,42 @@ def _not_node(node: _ExprNode) -> _ExprNode:
     return _ExprNode(op="NOT", args=(node,))
 
 
-_ExprFingerprint = Tuple[str, int, int]
+_ExprFingerprint = int
+_ExprSignature = Tuple[Any, ...]
 
 
 class _ExpressionHasher:
     COMMUTATIVE_OPS = {"AND", "OR", "XOR", "NAND", "NOR"}
 
     def __init__(self) -> None:
-        self._cache: Dict[int, _ExprFingerprint] = {}
+        self._cache: Dict[int, Tuple[_ExprNode, _ExprFingerprint]] = {}
+        self._fingerprints: Dict[_ExprSignature, _ExprFingerprint] = {}
+        self._next_fingerprint = 0
 
     def fingerprint(self, node: _ExprNode) -> _ExprFingerprint:
         node_id = id(node)
         cached = self._cache.get(node_id)
-        if cached is not None:
-            return cached
+        if cached is not None and cached[0] is node:
+            return cached[1]
 
         if node.op == "INPUT":
-            fingerprint = (node.op, hash((node.op, node.input_index)), 1)
+            signature = (node.op, node.input_index)
         elif node.op == "VARIABLE":
-            fingerprint = (
-                node.op,
-                hash((node.op, node.variable_name, node.variable_index)),
-                1,
-            )
+            signature = (node.op, node.variable_name, node.variable_index)
         elif node.op == "CONSTANT":
-            fingerprint = (node.op, hash((node.op, node.constant_value)), 1)
+            signature = (node.op, node.constant_value)
         else:
             child_fingerprints = [self.fingerprint(child) for child in node.args]
             if node.op in self.COMMUTATIVE_OPS:
                 child_fingerprints.sort()
-            fingerprint = (
-                node.op,
-                hash((node.op, tuple(child_fingerprints))),
-                1 + sum(child[2] for child in child_fingerprints),
-            )
+            signature = (node.op, tuple(child_fingerprints))
 
-        self._cache[node_id] = fingerprint
+        fingerprint = self._fingerprints.get(signature)
+        if fingerprint is None:
+            fingerprint = self._next_fingerprint
+            self._next_fingerprint += 1
+            self._fingerprints[signature] = fingerprint
+        self._cache[node_id] = (node, fingerprint)
         return fingerprint
 
 
@@ -730,16 +731,17 @@ def _parse_output_name(name: str) -> int | None:
     return int(name[3:])
 
 
-def _walk_tree(node: _ExprNode) -> List[_ExprNode]:
-    nodes = [node]
-    for child in node.args:
-        nodes.extend(_walk_tree(child))
-    return nodes
+def _iter_tree(node: _ExprNode) -> Iterator[_ExprNode]:
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(current.args))
 
 
 def _iter_variable_references(node: _ExprNode) -> List[str]:
     references: List[str] = []
-    for child in _walk_tree(node):
+    for child in _iter_tree(node):
         if child.op == "VARIABLE":
             assert child.variable_name is not None
             references.append(child.variable_name)

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "circuit-static-description"
-version = "0.1.7"
+version = "0.1.8"
 description = "A boolean gate circuit description package for saving, loading, and evaluating logic circuits."
 authors = ["GGN_2015 <neko@jlulug.org>"]
 readme = "README.md"
