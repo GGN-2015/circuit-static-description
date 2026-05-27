@@ -1,5 +1,5 @@
 # circuit-static-description
-A text-based boolean gate circuit description format that is easy to save and port.
+A boolean gate circuit description package with compact binary files and a readable legacy text format.
 
 ## Installation
 
@@ -19,10 +19,18 @@ This project provides a Python package named `circuit_static_description`. The p
 from circuit_static_description import Circuit
 ```
 
-### Circuit description format
+### Circuit file formats
 
-A circuit description contains the number of inputs, the number of outputs, optional intermediate variables, and the expression for each output.
+Circuit files can be saved in two formats:
 
+- Binary format, the default for `Circuit.save(...)`. It stores the parsed expression tree using a compact opcode and varuint encoding, so loading avoids reparsing text expressions.
+- Text format, kept for compatibility and readability. Old text files continue to load normally.
+
+`Circuit.load(...)` automatically detects binary files by their file header. If the header is not present, it reads the file as UTF-8 text.
+
+The text description contains the number of inputs, the number of outputs, optional intermediate variables, and the expression for each output.
+
+- Text comments start with `#`. The parser ignores everything from `#` to the end of the line, so comments may appear on their own line or after a definition.
 - Input references use `I0`, `I1`, `I2`, etc.
 - Intermediate variables use `V0`, `V1`, `V2`, etc. Only `V` followed by an integer is accepted as a variable name.
 - Variable definitions use `V<number> = expression` and may reference inputs and earlier or later variables.
@@ -34,12 +42,13 @@ A circuit description contains the number of inputs, the number of outputs, opti
 Example:
 
 ```text
+# This is a readable text circuit file.
 INPUTS 3
 OUTPUTS 2
 V0 = AND(I0, I1)
 V1 = XOR(V0, I2)
 OUT0 = V0
-OUT1 = NOR(I2, V1)
+OUT1 = NOR(I2, V1)  # trailing comments are allowed
 ```
 
 ### Saving a circuit
@@ -60,7 +69,9 @@ circuit = Circuit(
     ],
 )
 
-circuit.save("example.circuit")
+circuit.save("example.circuit")  # binary by default
+circuit.save("example-text.circuit", mode="text")
+circuit.save("example-binary.circuit", mode="binary")
 ```
 
 ### Loading a circuit
@@ -79,10 +90,21 @@ print(result)
 # Example output: [0, 0]
 ```
 
+By default, `evaluate(...)` returns all declared outputs in `OUT0`, `OUT1`, ... order. You can also request specific outputs or intermediate variables with `targets`:
+
+```python
+values = circuit.evaluate([1, 0, 1], targets=["V0", "OUT1"])
+print(values)
+# Example output: [0, 0]
+```
+
+`targets` accepts either one name such as `"V0"` or a list of names such as `["OUT0", "V1"]`. Target names must be `OUT<number>` or `V<number>`, and results are returned in the same order as requested.
+
 ### Notes
 
 - `evaluate` accepts a list of input values in input order.
 - The output is returned as a list of `0` or `1` values.
+- Intermediate variables can be read with `evaluate(inputs, targets="V0")` or mixed with outputs using `targets=["OUT0", "V1"]`.
 - Custom variable names are not supported. Intermediate variables must be named `V0`, `V1`, `V2`, etc.
 - Old files without variable definitions still load normally.
 
