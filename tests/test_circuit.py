@@ -170,6 +170,43 @@ class CircuitVariableTests(unittest.TestCase):
         with self.assertRaisesRegex(CircuitError, "Unknown evaluation target"):
             circuit.evaluate([1], targets=["TEMP"])
 
+    def test_count_accessors_report_inputs_outputs_and_logic_gates(self) -> None:
+        circuit = Circuit(
+            input_count=3,
+            output_count=3,
+            variables=[
+                ("V0", "AND(I0, I1)"),
+                ("V1", "XOR(V0, NOT(I2))"),
+                ("V2", "True"),
+            ],
+            outputs=[
+                "V1",
+                "NOR(I2, V0)",
+                "I0",
+            ],
+        )
+
+        self.assertEqual(circuit.get_input_count(), 3)
+        self.assertEqual(circuit.get_output_count(), 3)
+        self.assertEqual(circuit.get_gate_count(), 4)
+
+    def test_gate_count_is_preserved_after_binary_round_trip(self) -> None:
+        circuit = Circuit.from_text(
+            """
+            INPUTS 2
+            OUTPUTS 2
+            V0 = NAND(I0, I1)
+            OUT0 = V0
+            OUT1 = OR(V0, NOT(I1))
+            """
+        )
+
+        loaded = Circuit.from_binary(circuit.to_binary())
+
+        self.assertEqual(loaded.get_input_count(), 2)
+        self.assertEqual(loaded.get_output_count(), 2)
+        self.assertEqual(loaded.get_gate_count(), 3)
+
     def test_rejects_non_numeric_variable_name(self) -> None:
         with self.assertRaises(CircuitFormatError):
             Circuit.from_text(
@@ -277,6 +314,52 @@ class CircuitSimplifyTests(unittest.TestCase):
             "INPUTS 1\nOUTPUTS 2\nOUT0 = True\nOUT1 = True\n",
         )
         self.assertEqual(simplified.evaluate([0]), circuit.evaluate([0]))
+
+    def test_simplify_propagates_constant_variables_without_removing_them(self) -> None:
+        circuit = Circuit.from_text(
+            """
+            INPUTS 1
+            OUTPUTS 3
+            V0 = True
+            V2 = AND(V0, I0)
+            V5 = OR(False, V0)
+            OUT0 = AND(V0, I0)
+            OUT1 = NAND(V5, I0)
+            OUT2 = V2
+            """
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 1\nOUTPUTS 3\nV0 = True\nV2 = I0\nV5 = True\n"
+            "OUT0 = I0\nOUT1 = NOT(I0)\nOUT2 = V2\n",
+        )
+        self.assertEqual([name for name, _ in simplified.variables], ["V0", "V2", "V5"])
+        for value in [0, 1]:
+            self.assertEqual(simplified.evaluate([value]), circuit.evaluate([value]))
+
+    def test_simplify_propagates_later_constant_variable_references(self) -> None:
+        circuit = Circuit.from_text(
+            """
+            INPUTS 1
+            OUTPUTS 1
+            V3 = AND(V7, I0)
+            V7 = True
+            OUT0 = V3
+            """
+        )
+
+        simplified = circuit.simplify()
+
+        self.assertEqual(
+            simplified.to_text(),
+            "INPUTS 1\nOUTPUTS 1\nV3 = I0\nV7 = True\nOUT0 = V3\n",
+        )
+        self.assertEqual([name for name, _ in simplified.variables], ["V3", "V7"])
+        for value in [0, 1]:
+            self.assertEqual(simplified.evaluate([value]), circuit.evaluate([value]))
 
     def test_simplify_extracts_repeated_subexpressions_to_new_variables(self) -> None:
         circuit = Circuit(

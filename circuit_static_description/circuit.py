@@ -138,6 +138,11 @@ class Circuit:
             name: _simplify_expr_node(node, hasher) for name, node in parsed_variables.items()
         }
         simplified_outputs = [_simplify_expr_node(node, hasher) for node in parsed_outputs]
+        simplified_variables, simplified_outputs = _propagate_constant_variables(
+            self.variables,
+            simplified_variables,
+            simplified_outputs,
+        )
         variables, outputs = _extract_repeated_subexpressions(
             self.variables,
             simplified_variables,
@@ -286,6 +291,18 @@ class Circuit:
             else self._resolve_evaluation_targets(targets, graph)
         )
         return _evaluate_compiled_nodes(target_nodes, graph, inputs)
+
+    def get_input_count(self) -> int:
+        return self.input_count
+
+    def get_output_count(self) -> int:
+        return self.output_count
+
+    def get_gate_count(self) -> int:
+        graph = self._ensure_compiled_graph()
+        return sum(_count_logic_gates(node) for node in graph.variable_nodes) + sum(
+            _count_logic_gates(node) for node in graph.output_nodes
+        )
 
     def _ensure_parsed_outputs(self) -> List[_ExprNode]:
         graph = self._ensure_compiled_graph()
@@ -640,6 +657,77 @@ def _simplify_expr_node(
     return _ExprNode(op=node.op, args=args)
 
 
+def _propagate_constant_variables(
+    original_variables: Sequence[Tuple[str, str]],
+    simplified_variables: Dict[str, _ExprNode],
+    simplified_outputs: Sequence[_ExprNode],
+) -> Tuple[Dict[str, _ExprNode], List[_ExprNode]]:
+    constant_variables: Dict[str, _ExprNode] = {}
+    variable_nodes = dict(simplified_variables)
+    output_nodes = list(simplified_outputs)
+
+    while True:
+        changed = False
+        for name, _ in original_variables:
+            node = _replace_constant_variable_references(
+                variable_nodes[name],
+                constant_variables,
+                protected_name=name,
+            )
+            node = _simplify_expr_node(node)
+            if node != variable_nodes[name]:
+                variable_nodes[name] = node
+                changed = True
+            if node.op == "CONSTANT" and constant_variables.get(name) != node:
+                constant_variables[name] = node
+                changed = True
+
+        propagated_outputs: List[_ExprNode] = []
+        for node in output_nodes:
+            propagated_node = _replace_constant_variable_references(
+                node,
+                constant_variables,
+            )
+            propagated_node = _simplify_expr_node(propagated_node)
+            propagated_outputs.append(propagated_node)
+            if propagated_node != node:
+                changed = True
+        output_nodes = propagated_outputs
+
+        if not changed:
+            return variable_nodes, output_nodes
+
+
+def _replace_constant_variable_references(
+    node: _ExprNode,
+    constant_variables: Mapping[str, _ExprNode],
+    protected_name: str | None = None,
+) -> _ExprNode:
+    if node.op == "VARIABLE":
+        assert node.variable_name is not None
+        replacement = constant_variables.get(node.variable_name)
+        if replacement is not None and node.variable_name != protected_name:
+            return replacement
+        return node
+    if not node.args:
+        return node
+    return _ExprNode(
+        op=node.op,
+        args=tuple(
+            _replace_constant_variable_references(
+                child,
+                constant_variables,
+                protected_name,
+            )
+            for child in node.args
+        ),
+        input_index=node.input_index,
+        variable_name=node.variable_name,
+        variable_index=node.variable_index,
+        constant_value=node.constant_value,
+    )
+
+
 def _is_extractable_subexpression(node: _ExprNode) -> bool:
     return node.op in Circuit.SUPPORTED_OPS
 
@@ -737,6 +825,10 @@ def _iter_tree(node: _ExprNode) -> Iterator[_ExprNode]:
         current = stack.pop()
         yield current
         stack.extend(reversed(current.args))
+
+
+def _count_logic_gates(node: _ExprNode) -> int:
+    return sum(1 for child in _iter_tree(node) if child.op in Circuit.SUPPORTED_OPS)
 
 
 def _iter_variable_references(node: _ExprNode) -> List[str]:

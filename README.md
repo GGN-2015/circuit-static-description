@@ -87,7 +87,7 @@ You can also simplify manually. `simplify()` returns a new `Circuit` and leaves 
 simplified = circuit.simplify()
 ```
 
-Simplification folds constant-only logic, applies boolean identities such as `AND(True, X) = X` and `XOR(True, X) = NOT(X)`, and extracts repeated gate expressions into new intermediate variables. Existing variable names keep their original `V<number>` names.
+Simplification folds constant-only logic, applies boolean identities such as `AND(True, X) = X` and `XOR(True, X) = NOT(X)`, propagates constant intermediate variables through the circuit, and extracts repeated gate expressions into new intermediate variables. Existing inputs, outputs, and variable names keep their original numbering.
 
 ### Loading a circuit
 
@@ -114,6 +114,16 @@ print(values)
 ```
 
 `targets` accepts either one name such as `"V0"` or a list of names such as `["OUT0", "V1"]`. Target names must be `OUT<number>` or `V<number>`, and results are returned in the same order as requested.
+
+### Querying circuit size
+
+```python
+input_count = circuit.get_input_count()
+output_count = circuit.get_output_count()
+gate_count = circuit.get_gate_count()
+```
+
+`get_gate_count()` returns the number of supported logic operator nodes (`AND`, `OR`, `NOT`, `XOR`, `NAND`, `NOR`) declared in variable definitions and output expressions. Input references, variable references, and boolean literals are not counted as gates.
 
 ### Notes
 
